@@ -1,502 +1,365 @@
 #!/usr/bin/env python3
 """
-DV Joiner — Join .DV video files into MP4 format.
-
-Designed for archiving MiniDV/Digital8 footage. Scans directories for .dv files,
-sorts them chronologically by filename timestamps, and concatenates them into
-H.264/AAC MP4 files using ffmpeg.
-
-Handles filenames like: clip-2002-03-13 08;37;36.dv
-(semicolons as time separators from the original recorder)
+DV Video File Joiner
+====================
+Joins .DV files from a MiniDV/Digital8 tape recorder into modern MP4 (H.264/AAC).
+DV files from 2002 are typically:
+  - 720x576 (PAL) or 720x480 (NTSC) at 25fps or 29.97fps
+  - DV codec video, 16-bit PCM audio
+  - ~13GB/hour (~3.6MB/sec) for full DV, smaller clips proportional
+This script:
+  1. Scans directories for .dv/.DV files
+  2. Sorts them chronologically by filename (date/time stamp)
+  3. Groups files by recording session (configurable gap threshold)
+  4. Concatenates each group into a single MP4 using ffmpeg
+  5. Preserves original timestamps in output filenames
+Usage:
+  # Dry run first (always recommended)
+  python3 dv_joiner.py /path/to/dv/files --dry-run
+  # Process with defaults (groups files with <30min gap)
+  python3 dv_joiner.py /path/to/dv/files
+  # Limit to first 10 files for testing
+  python3 dv_joiner.py /path/to/dv/files --limit 10
+  # Process all 6 subdirectories, custom gap
+  python3 dv_joiner.py /path/to/dv/files --recursive --gap 60
+  # Join ALL files into one single video (no session grouping)
+  python3 dv_joiner.py /path/to/dv/files --single
 """
-
 import argparse
 import os
 import re
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-
-
-@dataclass
-class DVFile:
-    """A discovered .dv file with its parsed timestamp."""
-    path: Path
-    timestamp: datetime | None
-    folder: Path
-
-    def __lt__(self, other: "DVFile") -> bool:
-        if self.timestamp and other.timestamp:
-            return self.timestamp < other.timestamp
-        if self.timestamp:
-            return True
-        if other.timestamp:
-            return False
-        return str(self.path) < str(other.path)
-
-
-@dataclass
-class EncodingJob:
-    """A group of DV files to be joined into one MP4."""
-    name: str
-    files: list[DVFile] = field(default_factory=list)
-    output_path: Path | None = None
-
-
-# Regex for filenames like: clip-2002-03-13 08;37;36.dv
-TIMESTAMP_PATTERN = re.compile(
-    r"(\d{4})-(\d{2})-(\d{2})\s+(\d{2});(\d{2});(\d{2})"
-)
-
-# Alternate pattern with colons or hyphens as time separators
-TIMESTAMP_PATTERN_ALT = re.compile(
-    r"(\d{4})-(\d{2})-(\d{2})\s+(\d{2})[:.-](\d{2})[:.-](\d{2})"
-)
-
-
-def parse_timestamp(filename: str) -> datetime | None:
-    """Extract a datetime from a DV filename.
-
-    Handles formats like:
-        clip-2002-03-13 08;37;36.dv
-        clip-2002-03-13 08:37:36.dv
+# ─────────────────────────────────────────────
+# CONFIGURATION - Adjust these for your files
+# ─────────────────────────────────────────────
+# Common date/time patterns found in DV filenames from 2002-era recorders.
+# Add your own pattern if none of these match.
+# Each pattern: (regex, datetime format string)
+FILENAME_PATTERNS = [
+    # 2002-03-15_14-30-22.dv  or  2002-03-15 14-30-22.dv
+    (r"(\d{4}[-_]\d{2}[-_]\d{2}[-_ ]\d{2}[-_]\d{2}[-_]\d{2})", "%Y-%m-%d_%H-%M-%S"),
+    # 20020315_143022.dv  or  20020315143022.dv
+    (r"(\d{8}[-_]?\d{6})", None),  # handled specially
+    # 20020315_1430.dv (no seconds)
+    (r"(\d{8}[-_]?\d{4})(?!\d)", None),  # handled specially
+    # 15-03-2002_14-30-22.dv (DD-MM-YYYY)
+    (r"(\d{2}[-_]\d{2}[-_]\d{4}[-_ ]\d{2}[-_]\d{2}[-_]\d{2})", "%d-%m-%Y_%H-%M-%S"),
+    # Mar152002_143022.dv style
+    (r"([A-Za-z]{3}\d{1,2}\d{4}[-_]\d{6})", None),
+]
+def parse_datetime_from_filename(filename: str) -> datetime | None:
     """
-    for pattern in (TIMESTAMP_PATTERN, TIMESTAMP_PATTERN_ALT):
-        match = pattern.search(filename)
-        if match:
-            year, month, day, hour, minute, second = (int(g) for g in match.groups())
-            try:
-                return datetime(year, month, day, hour, minute, second)
-            except ValueError:
-                continue
+    Extract a datetime from a DV filename's date/time stamp.
+    Primary format: clip-2002-03-13 08;37;36.dv
+    Also handles other common patterns from 2002-era recorders.
+    """
+    stem = Path(filename).stem
+    # Normalise all separators: semicolons, spaces, underscores → consistent format
+    normalised = stem.replace(";", "-").replace(" ", "_").replace(".", "_")
+    # Pattern 1 (PRIMARY): clip-YYYY-MM-DD_HH-MM-SS
+    # Matches: clip-2002-03-13 08;37;36 → clip-2002-03-13_08-37-36
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})[-_ ](\d{2})-(\d{2})-(\d{2})", normalised)
+    if m:
+        try:
+            return datetime(int(m[1]), int(m[2]), int(m[3]),
+                            int(m[4]), int(m[5]), int(m[6]))
+        except ValueError:
+            pass
+    # Pattern 2: YYYYMMDD_HHMMSS or YYYYMMDDHHMMSS
+    m = re.search(r"(\d{4})(\d{2})(\d{2})[-_]?(\d{2})(\d{2})(\d{2})", normalised)
+    if m:
+        try:
+            return datetime(int(m[1]), int(m[2]), int(m[3]),
+                            int(m[4]), int(m[5]), int(m[6]))
+        except ValueError:
+            pass
+    # Pattern 3: YYYYMMDD_HHMM (no seconds)
+    m = re.search(r"(\d{4})(\d{2})(\d{2})[-_]?(\d{2})(\d{2})(?!\d)", normalised)
+    if m:
+        try:
+            return datetime(int(m[1]), int(m[2]), int(m[3]),
+                            int(m[4]), int(m[5]))
+        except ValueError:
+            pass
+    # Pattern 4: DD-MM-YYYY_HH-MM-SS (AU/EU format)
+    m = re.search(r"(\d{2})-(\d{2})-(\d{4})[-_ ](\d{2})-(\d{2})-(\d{2})", normalised)
+    if m:
+        try:
+            return datetime(int(m[3]), int(m[2]), int(m[1]),
+                            int(m[4]), int(m[5]), int(m[6]))
+        except ValueError:
+            pass
+    # Fallback: use file modification time
     return None
-
-
-def folder_sort_key(folder: Path) -> tuple[str, str]:
-    """Sort folders so base folder comes before suffixed ones.
-
-    Europe-Russia-Mongolia-China-2002     → ('Europe-Russia-Mongolia-China-2002', '')
-    Europe-Russia-Mongolia-China-2002-b   → ('Europe-Russia-Mongolia-China-2002', 'b')
-    Europe-Russia-Mongolia-China-2002-f   → ('Europe-Russia-Mongolia-China-2002', 'f')
-    """
-    name = folder.name
-    # Check if the folder name ends with a single letter suffix like -b, -c, etc.
-    match = re.match(r"^(.+)-([b-z])$", name, re.IGNORECASE)
-    if match:
-        return (match.group(1), match.group(2).lower())
-    return (name, "")
-
-
-def discover_dv_files(
-    root: Path, recursive: bool = False
-) -> dict[Path, list[DVFile]]:
-    """Find all .dv files under root, grouped by containing folder."""
-    files_by_folder: dict[Path, list[DVFile]] = {}
-
+def get_dv_files(source_dir: str, recursive: bool = False) -> list[dict]:
+    """Find all .dv/.DV files and extract their timestamps."""
+    source = Path(source_dir)
+    if not source.exists():
+        print(f"ERROR: Directory not found: {source_dir}")
+        sys.exit(1)
     if recursive:
-        for dirpath, _dirnames, filenames in os.walk(root):
-            folder = Path(dirpath)
-            for fname in filenames:
-                if fname.lower().endswith(".dv"):
-                    fpath = folder / fname
-                    ts = parse_timestamp(fname)
-                    dv = DVFile(path=fpath, timestamp=ts, folder=folder)
-                    files_by_folder.setdefault(folder, []).append(dv)
+        dv_files = list(source.rglob("*.dv")) + list(source.rglob("*.DV"))
     else:
-        for item in root.iterdir():
-            if item.is_file() and item.suffix.lower() == ".dv":
-                ts = parse_timestamp(item.name)
-                dv = DVFile(path=item, timestamp=ts, folder=root)
-                files_by_folder.setdefault(root, []).append(dv)
-
-    # Sort files chronologically within each folder
-    for folder in files_by_folder:
-        files_by_folder[folder].sort()
-
-    return files_by_folder
-
-
-def build_jobs(
-    files_by_folder: dict[Path, list[DVFile]],
-    mode: str,
-    gap_minutes: int = 30,
-    limit: int | None = None,
-    output_dir: Path | None = None,
-) -> list[EncodingJob]:
-    """Build encoding jobs from discovered files.
-
-    Modes:
-        per-folder: One job per source folder
-        single: All files in one job
-        gap: Split into sessions based on time gaps
+        dv_files = list(source.glob("*.dv")) + list(source.glob("*.DV"))
+    # Deduplicate (case-insensitive filesystems)
+    seen = set()
+    unique_files = []
+    for f in dv_files:
+        resolved = f.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique_files.append(f)
+    results = []
+    for f in unique_files:
+        dt = parse_datetime_from_filename(f.name)
+        if dt is None:
+            # Fall back to file modification time
+            mtime = os.path.getmtime(f)
+            dt = datetime.fromtimestamp(mtime)
+            print(f"  WARNING: Could not parse date from '{f.name}', using file mtime: {dt}")
+        results.append({
+            "path": f,
+            "datetime": dt,
+            "filename": f.name,
+            "size_mb": f.stat().st_size / (1024 * 1024),
+        })
+    # Sort chronologically
+    results.sort(key=lambda x: (x["datetime"], x["filename"]))
+    return results
+def get_duration(filepath: Path) -> float:
+    """Get video duration in seconds using ffprobe."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(filepath)],
+            capture_output=True, text=True, timeout=30
+        )
+        return float(result.stdout.strip())
+    except (subprocess.TimeoutExpired, ValueError):
+        return 0.0
+def group_by_session(files: list[dict], gap_minutes: int = 30) -> list[list[dict]]:
     """
-    # Sort folders using the custom sort key
-    sorted_folders = sorted(files_by_folder.keys(), key=folder_sort_key)
-
-    jobs: list[EncodingJob] = []
-
-    match mode:
-        case "per-folder":
-            for folder in sorted_folders:
-                folder_files = files_by_folder[folder]
-                if limit:
-                    folder_files = folder_files[:limit]
-                if not folder_files:
-                    continue
-                job = EncodingJob(name=folder.name, files=folder_files)
-                jobs.append(job)
-
-        case "single":
-            all_files: list[DVFile] = []
-            for folder in sorted_folders:
-                all_files.extend(files_by_folder[folder])
-            all_files.sort()
-            if limit:
-                all_files = all_files[:limit]
-            if all_files:
-                jobs.append(EncodingJob(name="joined_all", files=all_files))
-
-        case "gap":
-            all_files = []
-            for folder in sorted_folders:
-                all_files.extend(files_by_folder[folder])
-            all_files.sort()
-            if limit:
-                all_files = all_files[:limit]
-
-            if not all_files:
-                return jobs
-
-            current_job = EncodingJob(name="session_001", files=[all_files[0]])
-            session_num = 1
-
-            for prev, curr in zip(all_files, all_files[1:]):
-                if (
-                    prev.timestamp
-                    and curr.timestamp
-                    and (curr.timestamp - prev.timestamp).total_seconds()
-                    > gap_minutes * 60
-                ):
-                    jobs.append(current_job)
-                    session_num += 1
-                    current_job = EncodingJob(
-                        name=f"session_{session_num:03d}", files=[curr]
-                    )
-                else:
-                    current_job.files.append(curr)
-
-            jobs.append(current_job)
-
-    # Set output paths
-    if output_dir is None:
-        # Default: use a "joined" subdirectory relative to the first file
-        if jobs and jobs[0].files:
-            first_root = jobs[0].files[0].folder
-            # Walk up to find the common parent
-            parents = [f.folder for job in jobs for f in job.files]
-            output_dir = Path(os.path.commonpath(parents)) / "joined"
-        else:
-            output_dir = Path.cwd() / "joined"
-
-    for job in jobs:
-        safe_name = re.sub(r"[^\w\-.]", "_", job.name)
-        job.output_path = output_dir / f"{safe_name}.mp4"
-
-    return jobs
-
-
-def print_dry_run(jobs: list[EncodingJob]) -> None:
-    """Display what would happen without actually encoding."""
-    total_files = sum(len(j.files) for j in jobs)
-    print(f"\n{'='*60}")
-    print(f"DRY RUN — {len(jobs)} job(s), {total_files} file(s) total")
-    print(f"{'='*60}\n")
-
-    for i, job in enumerate(jobs, 1):
-        print(f"Job {i}: {job.name}")
-        print(f"  Output: {job.output_path}")
-        print(f"  Files:  {len(job.files)}")
-
-        # Estimate size (DV is ~3.6 MB/sec, ~13 GB/hour)
-        # Each DV file's actual size could be checked, but for dry run
-        # we just count files
-        total_bytes = 0
-        for dv in job.files:
-            try:
-                total_bytes += dv.path.stat().st_size
-            except OSError:
-                pass
-
-        if total_bytes > 0:
-            gb = total_bytes / (1024**3)
-            hours = total_bytes / (3.6 * 1024 * 1024) / 3600
-            print(f"  Source size: {gb:.1f} GB (~{hours:.1f} hours of footage)")
-
-        if job.files:
-            first = job.files[0]
-            last = job.files[-1]
-            ts_first = first.timestamp.strftime("%Y-%m-%d %H:%M:%S") if first.timestamp else "unknown"
-            ts_last = last.timestamp.strftime("%Y-%m-%d %H:%M:%S") if last.timestamp else "unknown"
-            print(f"  Time range: {ts_first} → {ts_last}")
-
-        # Show first few and last few files
-        show_count = 3
-        if len(job.files) <= show_count * 2:
-            for dv in job.files:
-                ts = dv.timestamp.strftime("%Y-%m-%d %H:%M:%S") if dv.timestamp else "no timestamp"
-                print(f"    {dv.path.name}  ({ts})")
-        else:
-            for dv in job.files[:show_count]:
-                ts = dv.timestamp.strftime("%Y-%m-%d %H:%M:%S") if dv.timestamp else "no timestamp"
-                print(f"    {dv.path.name}  ({ts})")
-            print(f"    ... {len(job.files) - show_count * 2} more files ...")
-            for dv in job.files[-show_count:]:
-                ts = dv.timestamp.strftime("%Y-%m-%d %H:%M:%S") if dv.timestamp else "no timestamp"
-                print(f"    {dv.path.name}  ({ts})")
-        print()
-
-
-def encode_job(job: EncodingJob, crf: int, preset: str) -> bool:
-    """Encode a single job using ffmpeg concat demuxer.
-
-    Returns True on success, False on failure.
+    Group files into recording sessions.
+    Files within `gap_minutes` of each other are considered the same session.
+    This handles cases where a recording was paused and resumed.
     """
-    if not job.files or not job.output_path:
-        return False
-
-    # Create output directory
-    job.output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Build concat file list
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".txt", delete=False, prefix="dvjoin_"
-    ) as concat_file:
-        for dv in job.files:
-            # ffmpeg concat demuxer requires escaped single quotes in paths
-            escaped = str(dv.path.resolve()).replace("'", "'\\''")
+    if not files:
+        return []
+    gap = timedelta(minutes=gap_minutes)
+    groups = [[files[0]]]
+    for f in files[1:]:
+        prev = groups[-1][-1]
+        # Estimate end time of previous file (get duration if small enough)
+        prev_duration = get_duration(prev["path"])
+        prev_end = prev["datetime"] + timedelta(seconds=prev_duration)
+        if f["datetime"] - prev_end > gap:
+            groups.append([f])
+        else:
+            groups[-1].append(f)
+    return groups
+def group_by_folder(files: list[dict]) -> list[tuple[str, list[dict]]]:
+    """
+    Group files by their parent folder, preserving folder sort order.
+    Within each folder, files are sorted chronologically.
+    Returns list of (folder_name, files) tuples, sorted by folder name.
+    This respects the trip chapter structure:
+      Europe-Russia-Mongolia-China-2002   → Chapter 1
+      Europe-Russia-Mongolia-China-2002-b → Chapter 2
+      ...
+      Europe-Russia-Mongolia-China-2002-f → Chapter 6
+    """
+    from collections import defaultdict
+    folders = defaultdict(list)
+    for f in files:
+        folder_name = f["path"].parent.name
+        folders[folder_name].append(f)
+    # Sort folders: base folder first (no suffix), then -b, -c, -d, -e, -f
+    def folder_sort_key(name: str) -> str:
+        # Folders ending in -b through -f sort after the base folder
+        # Base folder (no letter suffix) should come first
+        if re.search(r"-[a-z]$", name):
+            return name
+        else:
+            # Base folder sorts before -b by appending -a
+            return name + "-a"
+    sorted_folders = sorted(folders.keys(), key=folder_sort_key)
+    result = []
+    for folder in sorted_folders:
+        folder_files = sorted(folders[folder], key=lambda x: (x["datetime"], x["filename"]))
+        result.append((folder, folder_files))
+    return result
+def concatenate_dv_files(files: list[dict], output_path: Path, dry_run: bool = False,
+                         crf: int = 18, preset: str = "slow") -> bool:
+    """
+    Concatenate DV files into a single MP4 using ffmpeg concat demuxer.
+    DV files from the same recorder should have consistent format (PAL or NTSC),
+    making concat demuxer the fastest and most reliable method.
+    Args:
+        crf: Quality (0=lossless, 18=visually lossless, 23=default, 28=ok).
+             18 is recommended for archival of home videos.
+        preset: Encoding speed (ultrafast/fast/medium/slow/veryslow).
+                'slow' gives better compression with reasonable speed.
+    """
+    if dry_run:
+        total_mb = sum(f["size_mb"] for f in files)
+        print(f"  Would join {len(files)} files ({total_mb:.1f} MB) → {output_path.name}")
+        for f in files:
+            print(f"    - {f['filename']} ({f['size_mb']:.1f} MB, {f['datetime']})")
+        return True
+    # Create concat list file
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as concat_file:
+        for f in files:
+            # ffmpeg concat format requires escaping single quotes
+            escaped = str(f["path"].resolve()).replace("'", "'\\''")
             concat_file.write(f"file '{escaped}'\n")
-        concat_path = concat_file.name
-
+        concat_list_path = concat_file.name
     try:
         cmd = [
             "ffmpeg",
-            "-y",  # overwrite output
-            "-f", "concat",
-            "-safe", "0",
-            "-i", concat_path,
-            # Video: deinterlace and encode
-            "-vf", "yadif=mode=0",  # mode 0: one frame per field-pair
-            "-c:v", "libx264",
-            "-crf", str(crf),
-            "-preset", preset,
-            "-pix_fmt", "yuv420p",
-            # Audio: AAC
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-ar", "48000",
-            # Container options
-            "-movflags", "+faststart",
-            str(job.output_path),
+            "-y",                       # Overwrite output
+            "-f", "concat",             # Concat demuxer
+            "-safe", "0",               # Allow absolute paths
+            "-i", concat_list_path,     # Input file list
+            # Video encoding
+            "-c:v", "libx264",          # H.264 codec (universal playback)
+            "-crf", str(crf),           # Quality factor
+            "-preset", preset,          # Encoding speed/compression tradeoff
+            "-pix_fmt", "yuv420p",      # Compatibility with all players
+            # Handle interlaced DV content (common in 2002 recordings)
+            "-vf", "yadif=mode=0",      # Deinterlace (bob to progressive)
+            # Audio encoding
+            "-c:a", "aac",              # AAC audio
+            "-b:a", "192k",             # Good quality audio
+            "-ar", "48000",             # 48kHz (match DV audio)
+            # Container
+            "-movflags", "+faststart",  # Web/streaming friendly
+            str(output_path),
         ]
-
-        print(f"\nEncoding: {job.name}")
-        print(f"  {len(job.files)} files → {job.output_path}")
-        print(f"  Settings: CRF {crf}, preset {preset}")
-        print(f"  Command: {' '.join(cmd[:6])} ... {cmd[-1]}")
-        print()
-
-        result = subprocess.run(
-            cmd,
-            capture_output=False,
-            text=True,
-        )
-
-        if result.returncode == 0:
-            size = job.output_path.stat().st_size / (1024**2)
-            print(f"\n  Done: {job.output_path.name} ({size:.0f} MB)")
-            return True
-        else:
-            print(f"\n  ERROR: ffmpeg exited with code {result.returncode}")
+        print(f"  Encoding: {output_path.name} ({len(files)} files)...")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"  ERROR encoding {output_path.name}:")
+            # Show last few lines of ffmpeg output
+            for line in result.stderr.strip().split("\n")[-5:]:
+                print(f"    {line}")
             return False
-
+        output_size = output_path.stat().st_size / (1024 * 1024)
+        input_size = sum(f["size_mb"] for f in files)
+        ratio = (output_size / input_size * 100) if input_size > 0 else 0
+        print(f"  ✓ Done: {output_path.name} ({output_size:.1f} MB, {ratio:.0f}% of original)")
+        return True
     finally:
-        os.unlink(concat_path)
-
-
-def check_ffmpeg() -> bool:
-    """Verify ffmpeg is available."""
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-version"],
-            capture_output=True,
-            text=True,
-        )
-        return result.returncode == 0
-    except FileNotFoundError:
-        return False
-
-
-def main() -> int:
+        os.unlink(concat_list_path)
+def main():
     parser = argparse.ArgumentParser(
-        description="Join .DV video files into MP4 format.",
+        description="Join DV video files chronologically into modern MP4 format.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""\
+        epilog="""
 Examples:
-  %(prog)s /path/to/folder --recursive --per-folder --dry-run
-  %(prog)s /path/to/folder --recursive --per-folder --limit 10 --preset fast
-  %(prog)s /path/to/folder --recursive --per-folder
-        """,
+  %(prog)s /path/to/dv --dry-run                    # Preview what will happen
+  %(prog)s /path/to/dv --limit 10                    # Test with first 10 files
+  %(prog)s /path/to/dv --recursive --per-folder      # One MP4 per trip chapter (recommended)
+  %(prog)s /path/to/dv --recursive --single          # Everything into one big file
+  %(prog)s /path/to/dv -r --gap 120                  # Session-based, 2-hour gap
+        """
     )
-
-    parser.add_argument(
-        "source",
-        type=Path,
-        help="Source directory containing .dv files",
-    )
-
-    # Mode selection (mutually exclusive)
-    mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument(
-        "--per-folder",
-        action="store_const",
-        const="per-folder",
-        dest="mode",
-        help="One MP4 per source folder/chapter (recommended)",
-    )
-    mode_group.add_argument(
-        "--single",
-        action="store_const",
-        const="single",
-        dest="mode",
-        help="Join everything into one MP4",
-    )
-
-    parser.add_argument(
-        "--recursive", "-r",
-        action="store_true",
-        help="Search subdirectories for .dv files",
-    )
-    parser.add_argument(
-        "--gap",
-        type=int,
-        default=30,
-        metavar="N",
-        help="Split into sessions if gap exceeds N minutes (default: 30)",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Process only first N files per job (for testing)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Preview what would happen without encoding",
-    )
-    parser.add_argument(
-        "--output", "-o",
-        type=Path,
-        default=None,
-        help="Output directory (default: joined/ under source)",
-    )
-
-    # Encoding options
-    parser.add_argument(
-        "--crf",
-        type=int,
-        default=18,
-        metavar="N",
-        help="Quality: 0=lossless, 18=excellent (default), 23=good, 28=ok",
-    )
-    parser.add_argument(
-        "--preset",
-        default="slow",
-        choices=["ultrafast", "superfast", "veryfast", "faster", "fast",
-                 "medium", "slow", "slower", "veryslow"],
-        help="Encoding speed/quality tradeoff (default: slow)",
-    )
-
+    parser.add_argument("source", help="Directory containing .DV files")
+    parser.add_argument("-o", "--output", default=None,
+                        help="Output directory (default: 'joined' subdir in source)")
+    parser.add_argument("-r", "--recursive", action="store_true",
+                        help="Search subdirectories for .DV files")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Process only first N files (for testing)")
+    parser.add_argument("--gap", type=int, default=30,
+                        help="Minutes gap to split sessions (default: 30)")
+    parser.add_argument("--single", action="store_true",
+                        help="Join ALL files into one single output video")
+    parser.add_argument("--per-folder", action="store_true",
+                        help="One output video per folder (recommended for trip chapters)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show what would happen without encoding")
+    parser.add_argument("--crf", type=int, default=18,
+                        help="Video quality: 0=lossless, 18=excellent (default), 23=good, 28=ok")
+    parser.add_argument("--preset", default="slow",
+                        choices=["ultrafast", "fast", "medium", "slow", "veryslow"],
+                        help="Encoding speed (default: slow, better compression)")
+    parser.add_argument("--no-deinterlace", action="store_true",
+                        help="Skip deinterlacing (if source is already progressive)")
     args = parser.parse_args()
-
-    # Validate source directory
-    if not args.source.is_dir():
-        print(f"Error: '{args.source}' is not a directory", file=sys.stderr)
-        return 1
-
-    # Default mode
-    if args.mode is None:
-        args.mode = "per-folder" if args.recursive else "single"
-
-    # Check ffmpeg (unless dry run)
-    if not args.dry_run and not check_ffmpeg():
-        print(
-            "Error: ffmpeg not found. Install it with:\n"
-            "  macOS:  brew install ffmpeg\n"
-            "  Linux:  sudo apt install ffmpeg",
-            file=sys.stderr,
-        )
-        return 1
-
-    # Discover files
-    print(f"Scanning '{args.source}' for .dv files...")
-    files_by_folder = discover_dv_files(args.source, recursive=args.recursive)
-
-    total_files = sum(len(v) for v in files_by_folder.values())
-    if total_files == 0:
-        print("No .dv files found.", file=sys.stderr)
-        return 1
-
-    print(f"Found {total_files} .dv file(s) in {len(files_by_folder)} folder(s)")
-
-    # Handle gap-based splitting
-    mode = args.mode
-    if args.gap != 30 and mode != "single":
-        mode = "gap"
-
-    # Build jobs
-    output_dir = args.output or (args.source / "joined")
-    jobs = build_jobs(
-        files_by_folder,
-        mode=mode,
-        gap_minutes=args.gap,
-        limit=args.limit,
-        output_dir=output_dir,
-    )
-
-    if not jobs:
-        print("No encoding jobs to run.", file=sys.stderr)
-        return 1
-
-    # Dry run
-    if args.dry_run:
-        print_dry_run(jobs)
-        return 0
-
-    # Encode
-    print(f"\nStarting {len(jobs)} encoding job(s)...")
-    successes = 0
-    failures = 0
-
-    for job in jobs:
-        if encode_job(job, crf=args.crf, preset=args.preset):
-            successes += 1
+    # Find files
+    print(f"\nScanning for .DV files in: {args.source}")
+    if args.recursive:
+        print("  (including subdirectories)")
+    files = get_dv_files(args.source, recursive=args.recursive)
+    if not files:
+        print("No .DV files found!")
+        sys.exit(1)
+    print(f"\nFound {len(files)} DV files")
+    # Apply limit for testing
+    if args.limit:
+        files = files[:args.limit]
+        print(f"  (limited to first {args.limit} for testing)")
+    # Show date range
+    first_dt = files[0]["datetime"]
+    last_dt = files[-1]["datetime"]
+    total_mb = sum(f["size_mb"] for f in files)
+    print(f"  Date range: {first_dt.strftime('%Y-%m-%d %H:%M')} → {last_dt.strftime('%Y-%m-%d %H:%M')}")
+    print(f"  Total size: {total_mb:.1f} MB ({total_mb/1024:.2f} GB)")
+    # Setup output directory
+    output_dir = Path(args.output) if args.output else Path(args.source) / "joined"
+    if not args.dry_run:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  Output dir: {output_dir}")
+    # Group and process
+    if args.single:
+        groups = [("all", files)]
+        print(f"\nJoining all {len(files)} files into a single video")
+    elif args.per_folder and args.recursive:
+        folder_groups = group_by_folder(files)
+        groups = folder_groups
+        print(f"\nGrouped by folder into {len(groups)} chapter(s):")
+        for folder_name, folder_files in groups:
+            total = sum(f["size_mb"] for f in folder_files)
+            print(f"  {folder_name}: {len(folder_files)} files ({total:.1f} MB)")
+    else:
+        session_groups = group_by_session(files, gap_minutes=args.gap)
+        groups = [(f"session_{i:03d}", g) for i, g in enumerate(session_groups, 1)]
+        print(f"\nGrouped into {len(groups)} session(s) (gap threshold: {args.gap} min)")
+    print("=" * 60)
+    success = 0
+    failed = 0
+    for i, (group_name, group_files) in enumerate(groups, 1):
+        start_dt = group_files[0]["datetime"]
+        end_dt = group_files[-1]["datetime"]
+        if args.single:
+            output_name = f"all_recordings_{start_dt.strftime('%Y%m%d')}_{end_dt.strftime('%Y%m%d')}.mp4"
+        elif args.per_folder:
+            # Clean folder name for use as filename
+            safe_name = re.sub(r"[^\w\-]", "_", group_name)
+            output_name = f"{safe_name}.mp4"
+        elif len(groups) == 1:
+            output_name = f"recording_{start_dt.strftime('%Y%m%d_%H%M%S')}.mp4"
         else:
-            failures += 1
-
+            output_name = f"{group_name}_{start_dt.strftime('%Y%m%d_%H%M%S')}.mp4"
+        output_path = output_dir / output_name
+        print(f"\n[{i}/{len(groups)}] {group_name}: {start_dt.strftime('%Y-%m-%d %H:%M')} "
+              f"→ {end_dt.strftime('%Y-%m-%d %H:%M')} ({len(group_files)} files)")
+        if concatenate_dv_files(group_files, output_path, dry_run=args.dry_run,
+                                crf=args.crf, preset=args.preset):
+            success += 1
+        else:
+            failed += 1
     # Summary
-    print(f"\n{'='*60}")
-    print(f"Complete: {successes} succeeded, {failures} failed")
-    if successes > 0:
-        print(f"Output directory: {output_dir}")
-    print(f"{'='*60}")
-
-    return 1 if failures > 0 else 0
-
-
+    print("\n" + "=" * 60)
+    print(f"Complete: {success} session(s) processed, {failed} failed")
+    if args.dry_run:
+        print("\n** This was a DRY RUN - no files were created **")
+        print(f"** Re-run without --dry-run to encode **")
+    if not args.dry_run and success > 0:
+        print(f"\nOutput files in: {output_dir}")
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
