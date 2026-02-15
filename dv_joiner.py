@@ -95,7 +95,7 @@ def parse_datetime_from_filename(filename: str) -> datetime | None:
             pass
     # Fallback: use file modification time
     return None
-def get_dv_files(source_dir: str, recursive: bool = False) -> list[dict]:
+def get_dv_files(source_dir: str, recursive: bool = False, verbose: bool = False) -> list[dict]:
     """Find all .dv/.DV files and extract their timestamps."""
     source = Path(source_dir)
     if not source.exists():
@@ -105,6 +105,16 @@ def get_dv_files(source_dir: str, recursive: bool = False) -> list[dict]:
         dv_files = list(source.rglob("*.dv")) + list(source.rglob("*.DV"))
     else:
         dv_files = list(source.glob("*.dv")) + list(source.glob("*.DV"))
+    if verbose:
+        print(f"  Raw file matches: {len(dv_files)}")
+        folders_seen = set()
+        for f in dv_files:
+            folder = str(f.parent)
+            if folder not in folders_seen:
+                folders_seen.add(folder)
+                folder_count = sum(1 for x in dv_files if str(x.parent) == folder)
+                print(f"    {f.parent.name}/: {folder_count} file(s)")
+
     # Deduplicate (case-insensitive filesystems)
     seen = set()
     unique_files = []
@@ -114,7 +124,14 @@ def get_dv_files(source_dir: str, recursive: bool = False) -> list[dict]:
             seen.add(resolved)
             unique_files.append(f)
     results = []
+    skipped = 0
     for f in unique_files:
+        # Validate DV file is readable before including it
+        if not validate_dv_file(f):
+            size_kb = f.stat().st_size / 1024
+            print(f"  SKIPPING invalid/corrupt DV file: {f.name} ({size_kb:.0f} KB) in {f.parent.name}/")
+            skipped += 1
+            continue
         dt = parse_datetime_from_filename(f.name)
         if dt is None:
             # Fall back to file modification time
@@ -127,6 +144,8 @@ def get_dv_files(source_dir: str, recursive: bool = False) -> list[dict]:
             "filename": f.name,
             "size_mb": f.stat().st_size / (1024 * 1024),
         })
+    if skipped:
+        print(f"  Skipped {skipped} invalid/corrupt file(s)")
     # Sort chronologically
     results.sort(key=lambda x: (x["datetime"], x["filename"]))
     return results
@@ -141,6 +160,21 @@ def get_duration(filepath: Path) -> float:
         return float(result.stdout.strip())
     except (subprocess.TimeoutExpired, ValueError):
         return 0.0
+
+def validate_dv_file(filepath: Path) -> bool:
+    """Check if a DV file is readable by ffprobe (has a valid DV header)."""
+    if filepath.stat().st_size < 120000:  # DV frames are ~120KB; smaller = likely corrupt
+        return False
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(filepath)],
+            capture_output=True, text=True, timeout=30
+        )
+        return result.returncode == 0 and result.stdout.strip() != ""
+    except subprocess.TimeoutExpired:
+        return False
 def group_by_session(files: list[dict], gap_minutes: int = 30) -> list[list[dict]]:
     """
     Group files into recording sessions.
@@ -289,16 +323,20 @@ Examples:
                         help="Encoding speed (default: slow, better compression)")
     parser.add_argument("--no-deinterlace", action="store_true",
                         help="Skip deinterlacing (if source is already progressive)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Show detailed info about file discovery and validation")
     args = parser.parse_args()
     # Find files
     print(f"\nScanning for .DV files in: {args.source}")
     if args.recursive:
         print("  (including subdirectories)")
-    files = get_dv_files(args.source, recursive=args.recursive)
+    files = get_dv_files(args.source, recursive=args.recursive, verbose=args.verbose)
     if not files:
-        print("No .DV files found!")
+        print("No valid .DV files found! (files may be corrupt or missing DV headers)")
+        print("  Tip: Check that the source folder contains actual DV recordings,")
+        print("       not iMovie project references or placeholder files.")
         sys.exit(1)
-    print(f"\nFound {len(files)} DV files")
+    print(f"\nFound {len(files)} valid DV files")
     # Apply limit for testing
     if args.limit:
         files = files[:args.limit]
