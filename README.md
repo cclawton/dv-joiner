@@ -1,104 +1,119 @@
-# Trans-Siberian DV Archive Project
+# dv-joiner
 
-**Status:** Ready to test
+A small Python utility for joining timestamped DV video clips into modern MP4 files with FFmpeg.
 
-**Created:** 2026-02-15
+It is designed for personal video archives where clips are spread across folders and filenames carry recording timestamps such as `clip-2002-03-13 08;37;36.dv`.
 
-**Chat:** [Original Claude conversation](https://claude.ai)
+## What it does
 
----
+1. Scans directories for `.dv` and `.DV` files
+2. Parses recording dates and times from several filename formats
+3. Sorts clips chronologically
+4. Groups clips by folder, recording session, or a single combined output
+5. Uses FFmpeg to encode H.264 video and AAC audio in an MP4 container
+6. Deinterlaces typical PAL or NTSC DV footage with `yadif`
 
-## Summary
+## Requirements
 
-Python script to join `.DV` video files from Craig & Anna's 2002 Trans-Siberian trip (Europe → Russia → Mongolia → China) into modern MP4 format. The raw footage is organised across 6 folders representing trip chapters, with filenames containing date/time stamps in the format `clip-2002-03-13 08;37;36.dv`.
+- Python 3.10+
+- [FFmpeg](https://ffmpeg.org/), including `ffprobe`
 
-## What the Script Does
-
-1. Scans directories recursively for `.dv` / `.DV` files
-2. Parses date/time from filenames (handles semicolons in `clip-YYYY-MM-DD HH;MM;SS.dv`)
-3. Sorts files chronologically within each folder
-4. Concatenates using ffmpeg's concat demuxer into H.264/AAC MP4
-5. Deinterlaces PAL DV (720×576i @ 25fps) to progressive
-6. Encodes at CRF 18 (visually lossless — ideal for home video archival)
-
-## Folder Structure
-
-The 6 source folders represent trip chapters, sorted alphabetically:
-
-```
-Europe-Russia-Mongolia-China-2002     → Chapter 1 (base)
-Europe-Russia-Mongolia-China-2002-b   → Chapter 2
-Europe-Russia-Mongolia-China-2002-c   → Chapter 3
-Europe-Russia-Mongolia-China-2002-d   → Chapter 4
-Europe-Russia-Mongolia-China-2002-e   → Chapter 5
-Europe-Russia-Mongolia-China-2002-f   → Chapter 6
-```
-
-Each folder produces one MP4 output file.
-
-## Prerequisites
-
-- **Python 3.10+** (uses `match` union types)
-- **ffmpeg** — `brew install ffmpeg` (macOS) or `sudo apt install ffmpeg` (Linux)
-
-## Quick Start
-
-### Step 1 — Dry run (see what will happen, no encoding)
+Install FFmpeg on macOS with Homebrew:
 
 ```bash
-python3 dv_joiner.py /path/to/parent/folder --recursive --per-folder --dry-run
+brew install ffmpeg
 ```
 
-### Step 2 — Test with first 10 files (fast encode)
+On Debian or Ubuntu:
 
 ```bash
-python3 dv_joiner.py /path/to/parent/folder --recursive --per-folder --limit 10 --preset fast
+sudo apt install ffmpeg
 ```
 
-### Step 3 — Full encode (all 6 chapters)
+## Quick start
+
+Start with a dry run to inspect ordering and grouping without encoding:
 
 ```bash
-python3 dv_joiner.py /path/to/parent/folder --recursive --per-folder
+python3 dv_joiner.py /path/to/archive --recursive --per-folder --dry-run
 ```
 
-Output goes to a `joined/` subdirectory.
+Test a small batch:
 
-## Key Options
+```bash
+python3 dv_joiner.py /path/to/archive --recursive --per-folder --limit 10 --preset fast
+```
 
-| Flag | What it does |
+Run the full encode:
+
+```bash
+python3 dv_joiner.py /path/to/archive --recursive --per-folder
+```
+
+Output goes to a `joined/` directory under the source path unless `--output` is supplied.
+
+## Common modes
+
+### One MP4 per source folder
+
+Useful when archive folders already represent tapes, days, or chapters:
+
+```bash
+python3 dv_joiner.py /path/to/archive --recursive --per-folder
+```
+
+### Group by recording session
+
+The default mode starts a new output when the gap between clips exceeds 30 minutes:
+
+```bash
+python3 dv_joiner.py /path/to/archive --recursive --gap 30
+```
+
+### Join everything
+
+```bash
+python3 dv_joiner.py /path/to/archive --recursive --single
+```
+
+## Options
+
+| Flag | Purpose |
 | --- | --- |
-| `--recursive` / `-r` | Search all subdirectories |
-| `--per-folder` | One MP4 per folder/chapter (recommended) |
-| `--single` | Join everything into one giant MP4 |
-| `--gap N` | Session grouping: split if >N minutes gap (default 30) |
-| `--limit N` | Process only first N files (for testing) |
-| `--dry-run` | Preview without encoding |
-| `--crf N` | Quality: 0=lossless, 18=excellent (default), 23=good |
-| `--preset` | Speed: ultrafast/fast/medium/slow(default)/veryslow |
+| `--recursive`, `-r` | Search subdirectories |
+| `--per-folder` | Produce one MP4 per source folder |
+| `--single` | Join all discovered clips into one MP4 |
+| `--gap N` | Start a new session after a gap of N minutes |
+| `--limit N` | Process only the first N clips |
+| `--dry-run` | Preview ordering, grouping, size, and output names |
+| `--output PATH`, `-o PATH` | Choose the output directory |
+| `--crf N` | Set H.264 quality. Lower values retain more detail |
+| `--preset NAME` | Choose the FFmpeg encoding speed preset |
 
-## Technical Notes
+Run `python3 dv_joiner.py --help` for the complete CLI reference.
 
-- **DV format:** Raw DV from 2002 MiniDV/Digital8 recorders. PAL = 720×576 interlaced @ 25fps, ~3.6 MB/sec (~13 GB/hour)
-- **Deinterlacing:** Uses yadif (mode 0) to convert interlaced fields to progressive frames
-- **Output codec:** H.264 (libx264) with AAC audio at 192kbps, 48kHz — plays everywhere
-- **Container:** MP4 with faststart flag for streaming compatibility
-- **Filename parsing:** Handles semicolons as time separators (`08;37;36`), which is non-standard but matches the recorder's output
-- **Folder ordering:** Base folder (no suffix) sorts before `-b` through `-f`
+## Filename handling
 
-## Encoding Time Estimates
+The parser recognises several timestamp styles, including:
 
-Rough guide for a modern Mac (M-series):
+```text
+clip-2002-03-13 08;37;36.dv
+2002-03-15_14-30-22.dv
+20020315_143022.dv
+20020315_1430.dv
+15-03-2002_14-30-22.dv
+```
 
-| Preset | Speed vs realtime | 1 hour of DV |
-| --- | --- | --- |
-| ultrafast | ~10x | ~6 min |
-| fast | ~5x | ~12 min |
-| slow (default) | ~2x | ~30 min |
-| veryslow | ~0.8x | ~75 min |
+If no timestamp can be parsed, the script falls back to the file modification time and prints a warning.
 
-## Future Enhancements
+## Encoding defaults
 
-- Add chapter markers in the MP4 based on time gaps between clips
-- Generate thumbnail contact sheet for each chapter
-- Overlay date/location text on first frame of each clip
-- Extract and geotag based on trip itinerary dates
+- Video: H.264 via `libx264`
+- Quality: CRF 18
+- Preset: `slow`
+- Pixel format: `yuv420p`
+- Deinterlacing: `yadif=mode=0`
+- Audio: AAC, 192 kbps, 48 kHz
+- Container: MP4 with `faststart`
+
+Archival workflows differ. Keep the original DV files after conversion and test a representative sample before processing a large archive.
