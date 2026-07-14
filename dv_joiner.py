@@ -193,7 +193,8 @@ def group_by_folder(files: list[dict]) -> list[tuple[str, list[dict]]]:
         result.append((folder, folder_files))
     return result
 def concatenate_dv_files(files: list[dict], output_path: Path, dry_run: bool = False,
-                         crf: int = 18, preset: str = "slow") -> bool:
+                         crf: int = 18, preset: str = "slow",
+                         deinterlace: bool = True) -> bool:
     """
     Concatenate DV files into a single MP4 using ffmpeg concat demuxer.
     DV files from the same recorder should have consistent format (PAL or NTSC),
@@ -229,8 +230,6 @@ def concatenate_dv_files(files: list[dict], output_path: Path, dry_run: bool = F
             "-crf", str(crf),           # Quality factor
             "-preset", preset,          # Encoding speed/compression tradeoff
             "-pix_fmt", "yuv420p",      # Compatibility with all players
-            # Handle interlaced DV content (common in 2002 recordings)
-            "-vf", "yadif=mode=0",      # Deinterlace (bob to progressive)
             # Audio encoding
             "-c:a", "aac",              # AAC audio
             "-b:a", "192k",             # Good quality audio
@@ -239,6 +238,9 @@ def concatenate_dv_files(files: list[dict], output_path: Path, dry_run: bool = F
             "-movflags", "+faststart",  # Web/streaming friendly
             str(output_path),
         ]
+        if deinterlace:
+            # Emit one progressive frame for each input frame.
+            cmd[-1:-1] = ["-vf", "yadif=mode=0"]
         print(f"  Encoding: {output_path.name} ({len(files)} files)...")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -349,7 +351,8 @@ Examples:
         print(f"\n[{i}/{len(groups)}] {group_name}: {start_dt.strftime('%Y-%m-%d %H:%M')} "
               f"→ {end_dt.strftime('%Y-%m-%d %H:%M')} ({len(group_files)} files)")
         if concatenate_dv_files(group_files, output_path, dry_run=args.dry_run,
-                                crf=args.crf, preset=args.preset):
+                                crf=args.crf, preset=args.preset,
+                                deinterlace=not args.no_deinterlace):
             success += 1
         else:
             failed += 1

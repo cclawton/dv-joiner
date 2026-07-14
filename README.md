@@ -89,6 +89,7 @@ python3 dv_joiner.py /path/to/archive --recursive --single
 | `--output PATH`, `-o PATH` | Choose the output directory |
 | `--crf N` | Set H.264 quality. Lower values retain more detail |
 | `--preset NAME` | Choose the FFmpeg encoding speed preset |
+| `--no-deinterlace` | Skip `yadif` for progressive source footage |
 
 Run `python3 dv_joiner.py --help` for the complete CLI reference.
 
